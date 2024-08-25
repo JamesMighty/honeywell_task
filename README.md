@@ -46,7 +46,7 @@ Implementation is multiplexed so multiple clients can connect at once.
 
 ### Client
 
-tkinter GUI with possibility to select and send multiple files in series.
+Tkinter GUI with possibility to select and send multiple files in series.
 On first start json config is generated.
 From within GUI you can save/load configuration run-time.
 You can cancel transfer anytime, file will be removed on the server side.

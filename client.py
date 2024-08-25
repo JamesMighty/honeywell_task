@@ -393,10 +393,10 @@ class MainWindow:
                                font="TkMenuFont",
                                bg='SystemButtonFace',
                                fg=_fgcolor,)
-        settingsmenu = tk.Menu(self.menubar, tearoff=0)
-        settingsmenu.add_command(label="Save", command=self._save_settings)
-        settingsmenu.add_command(label="Load", command=self._load_settings)
-        self.menubar.add_cascade(label="Settings", menu=settingsmenu)
+        self.settingsmenu = tk.Menu(self.menubar, tearoff=0)
+        self.settingsmenu.add_command(label="Save", command=self._save_settings)
+        self.settingsmenu.add_command(label="Load", command=self._load_settings)
+        self.menubar.add_cascade(label="Settings", menu=self.settingsmenu)
         top.configure(menu=self.menubar)
 
 
@@ -760,13 +760,17 @@ class AddServerDialog:
     def _test_button_click(self):
         try:
             # Check sanity
-            ip4 = socket.gethostbyname(self.host.get())
+            try:
+                ip4 = socket.gethostbyname(self.host.get())
+            except:
+                raise ValueError("Host must be valid IP or hostname")
+
             port = self.port.get()
             if port < 0 or port > 65535:
                 raise ValueError("Port number must be between 0 and 65535")
 
             self.AddButton.configure(state=tk.NORMAL)
-            self.top.update()
+            self.top.update_idletasks()
 
             # test
             cli = Client(self._logger)
@@ -779,11 +783,11 @@ class AddServerDialog:
                 msg = "Remote server test ERROR"
                 self.logger.info(msg)
                 self.StatusLabel.configure(text=msg, fg=RED)
+
         except Exception as err:
             self.logger.warning(f"Check error", exc_info=err)
             self.StatusLabel.configure(text=str(err), fg=RED)
 
-        self.AddButton.configure(state=tk.NORMAL)
 
     def _add_button_click(self):
         self.data['host'] = self.host.get()
