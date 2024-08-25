@@ -9,8 +9,8 @@ from collections import deque
 from dataclasses import asdict, dataclass
 from enum import Enum
 from io import TextIOWrapper
-from logging import (DEBUG, ERROR, INFO, WARNING, FileHandler, Formatter, Logger,
-                     LoggerAdapter, StreamHandler)
+from logging import (DEBUG, ERROR, INFO, WARNING, FileHandler, Formatter,
+                     Logger, LoggerAdapter, StreamHandler)
 from pathlib import Path
 
 # End of transmission block
@@ -111,6 +111,7 @@ class ClientSession:
         })
 
     def parse_block(self) -> ActionData:
+        """Parse data block from session bytes input"""
         try:
             self.logger.debug(f"Parsing from inb: '{self.inb}'")
             split = self.inb.split(ETB, 1)[0]
@@ -122,7 +123,7 @@ class ClientSession:
 
             self.logger.info(f"New queued action: {json.dumps(data, indent=4)}")
         except Exception as exc:
-            self.logger.warning(f"WARN - could not parse block into action data: {exc}, dropping")
+            self.logger.warning(f"WARN - could not parse block into action data, dropping", exc_info=exc)
 
             self.outb.extend(str(exc).encode(self.encoding))
             self.outb.extend(ERROR_B)
@@ -132,6 +133,7 @@ class ClientSession:
 
 
 class Server:
+    """"File transfer server implementation"""
 
     def __init__(self,
                  host: str = None,
@@ -154,16 +156,16 @@ class Server:
 
     def start(self):
         if self.host is None:
-            self.host = socket.gethostname()                                    # Get local machine name
+            self.host = socket.gethostname()
 
-        self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)         # Create a socket object
-        self.socket.bind((self.host, self.port))                                # Bind to the port
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.socket.bind((self.host, self.port))
 
         self.socket.listen()
-        self.socket.setblocking(False)                                           # Now wait for client connection.
+        self.socket.setblocking(False)
         self.sel.register(self.socket, selectors.EVENT_READ, data=None)
 
-        self.logger.info(f"Server listening on {self.host}:{self.port}")
+        self.logger.info(f"Server listening on {self.host}:{self.port}, root dir: {self.root_dir}")
 
         while True:
             for key in self.sel.get_map().values():
@@ -176,7 +178,6 @@ class Server:
                     self._accept_connection(key.fileobj)
                 else:
                     self._handle_connection(key, mask)
-
 
     def _handle_action(self, session: ClientSession):
         if len(session.actions) == 0:
@@ -207,9 +208,9 @@ class Server:
                 logger.info(f"Set file info to {json.dumps(asdict(session.file_info), indent=4)}")
 
                 session.outb.extend(OK_B)
-            except Exception as exc:
-                session.outb.extend(str(exc).encode(session.encoding))
-                logger.warning("Could not set file info for this session", exc_info=exc)
+            except Exception as err:
+                session.outb.extend(str(err).encode(session.encoding))
+                logger.warning("Could not set file info for this session", exc_info=err)
 
         elif action.action == Actions.START_SEND:
             try:
@@ -226,9 +227,9 @@ class Server:
                 session.outb.extend(OK_B)
 
                 logger.info(f"Prepared to receive file")
-            except Exception as exc:
-                session.outb.extend(str(exc).encode(session.encoding))
-                logger.warning(f"Could not prepare to receive file", exc_info=exc)
+            except Exception as err:
+                session.outb.extend(str(err).encode(session.encoding))
+                logger.warning(f"Could not prepare to receive file", exc_info=err)
 
         elif action.action == Actions.CLEAR_FILE_INFO:
             if session.is_receiving_file:
@@ -243,12 +244,13 @@ class Server:
         elif action.action == Actions.SET_FILE_BLOCK_SIZE:
             try:
                 session.file_block_size = min(self.file_block_size, int(action.data))
+                logger.info(f"File block size set to {session.file_block_size}")
                 session.outb.extend(OK_B)
             except Exception as err:
+                logger.info(f"File block size could not be set to {session.file_block_size}", exc_info=err)
                 session.outb.extend(str(err).encode(session.encoding))
 
         session.outb.extend(ETB)
-
 
     def _accept_connection(self, sock: socket.socket):
         """Handle new client connection"""
@@ -319,25 +321,11 @@ class Server:
                             session.parse_block()
 
                 else:
-                    self.logger.info(f"Closing connection to {session.addr}")
-                    if session.file_io:
-                        session.file_io.close()
-                        session.logger.warning(f"File {session.file_info.dest_path} was still open, closing ..")
+                    self._close_connection(key)
 
-                    _ = self.sel.unregister(key.fileobj)
-
-                    sock.close()
-
-            except WindowsError as exc:
-                session.logger.error(f"ERROR - connection with {session.addr} - {exc}")
-                self.logger.info(f"Closing connection to {session.addr}")
-                if session.file_io:
-                    session.file_io.close()
-                    session.logger.warning(f"File {session.file_info.dest_path} was still open, closing ..")
-
-                _ = self.sel.unregister(key.fileobj)
-                sock.close()
-
+            except WindowsError as err:
+                session.logger.error(f"ERROR - connection with {session.addr}", exc_info=err)
+                self._close_connection(key)
 
         if mask & selectors.EVENT_WRITE:
             if session.outb:
@@ -345,11 +333,23 @@ class Server:
                     self.logger.debug(f"Trying to send data from outb '{session.outb}'")
                     sent = sock.send(session.outb)  # Should be ready to write
                     session.outb = session.outb[sent:]
-                except Exception as exc:
-                    self.logger.error(exc)
-                    _ = self.sel.unregister(key.fileobj)
-                    session.outb = b""
+                except Exception as err:
+                    self.logger.error(err)
+                    self._close_connection(key)
 
+    def _close_connection(self, key: selectors.SelectorKey):
+        sock: socket.socket = key.fileobj
+        session: ClientSession = key.data
+
+        self.logger.info(f"Closing connection to {session.addr}")
+
+        if session.file_io:
+            session.file_io.close()
+            session.logger.warning(f"File {session.file_info.dest_path} was still open, closing ..")
+
+        _ = self.sel.unregister(key.fileobj)
+
+        sock.close()
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(

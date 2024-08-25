@@ -155,7 +155,7 @@ class Client:
         self.logger = LoggerAdapter(logger)
 
     def connect(self, host: str, port: int):
-
+        """Connect to specific host, if connection already established, disconnect first"""
         if self.sock:
             self.close()
 
@@ -166,6 +166,7 @@ class Client:
         self.logger.info(f"Connected to {host}:{port}")
 
     def _sent_action(self, action: ActionData, msg: ResponseMsg = None) -> bool:
+        """Sends action data to server side, waits for response and check status"""
         self.logger.info(f"Sending action {action.action.name}")
         action_send_ok = False
         try:
@@ -181,6 +182,7 @@ class Client:
         return action_send_ok and resp_ok
 
     def _read_responses(self, msg: ResponseMsg = None) -> bool:
+        """waits for response from server and parses them to respose queue"""
         try:
             self.sock.setblocking(True)
             s = self.sock.recv(self.buffer_size)
@@ -668,15 +670,18 @@ class MainWindow:
                 self.print_status("Error when sending file info", RED, action_msg)
                 continue
 
+            self.print_status(f"Transferring {src}")
+
             action_msg = ResponseMsg()
             if self.client.send_file(src, file_inf.size, action_msg):
-                self.print_status(f"File {src} send successfully", GREEN, action_msg)
+                self.print_status(f"File {src} sent successfully", GREEN, action_msg)
                 to_rm.append(i)
             else:
                 self.print_status(f"File {src} could not be send", RED, action_msg)
                 if action_msg and hasattr(action_msg, "server_response"):
                     if action_msg.server_response == CANCELED:
-                        self.print_status(f"Sending {src} canceled", action_msg=action_msg)
+                        self.print_status(f"Sending {src} canceled", ORANGE, action_msg=action_msg)
+                main_window.TProgressbar.configure(value=0)
 
             main_window.CancelButton.configure(state=tk.DISABLED)
 
@@ -684,7 +689,6 @@ class MainWindow:
             self.FilesScrolledlistbox.delete(i)
 
         self._update_states()
-
 
     def _load_settings(self):
         try:
@@ -706,7 +710,7 @@ class AddServerDialog:
 
     def __init__(self, logger: Logger, top: tk.Tk = None, data: object = None):
 
-        top.geometry("380x170")
+        top.geometry("380x180")
         top.resizable(0,  0)
         top.title("Add new server ")
         top.configure(highlightcolor="SystemWindowText")
@@ -715,6 +719,7 @@ class AddServerDialog:
         self.top = top
         self.host = StringVar()
         self.port = IntVar()
+        self._logger = logger
         self.logger = LoggerAdapter(logger, extra={
             "window": "Add Server Window"
             })
@@ -731,8 +736,8 @@ class AddServerDialog:
         self.PortEntry = tk.Entry(self.top, textvariable=self.port, **WIDGET_DEFAULTS)
         self.PortEntry.place(x=143, y=52, height=20, width=204)
 
-        self.StatusLabel = tk.Label(self.top, text='''Status:''', wraplength=116, **LABEL_DEFAULTS)
-        self.StatusLabel.place(x=21, y=83, height=42, width=116)
+        self.StatusLabel_ = tk.Label(self.top, text='''Status:''', wraplength=116, **LABEL_DEFAULTS)
+        self.StatusLabel_.place(x=21, y=83, height=42, width=116)
 
         self.StatusLabel = tk.Label(self.top, wraplength=205, **LABEL_DEFAULTS)
         self.StatusLabel.place(x=143, y=83, height=42, width=209)
@@ -741,30 +746,42 @@ class AddServerDialog:
                                     command=self._test_button_click,
                                     text='''Test''',
                                     **WIDGET_DEFAULTS)
-        self.TestButton.place(x=240, y=120, height=26, width=47)
+        self.TestButton.place(x=240, y=135, height=26, width=47)
 
         self.AddButton = tk.Button(self.top, state=tk.DISABLED,
                                    command=self._add_button_click,
                                    text='''Add''',
                                    **WIDGET_DEFAULTS)
-        self.AddButton.place(x=300, y=120, height=26, width=47)
+        self.AddButton.place(x=300, y=135, height=26, width=47)
 
         self.host.trace_add("write", lambda _, _b, _c: self.AddButton.configure(state=tk.DISABLED))
         self.port.trace_add("write", lambda _, _b, _c: self.AddButton.configure(state=tk.DISABLED))
 
     def _test_button_click(self):
         try:
+            # Check sanity
             ip4 = socket.gethostbyname(self.host.get())
-            self.AddButton.configure(state=tk.NORMAL)
+            port = self.port.get()
+            if port < 0 or port > 65535:
+                raise ValueError("Port number must be between 0 and 65535")
 
-            cli = Client()
-            cli.connect(ip4, self.port.get())
+            self.AddButton.configure(state=tk.NORMAL)
+            self.top.update()
+
+            # test
+            cli = Client(self._logger)
+            cli.connect(ip4, port)
             if cli.test_connection():
-                self.StatusLabel.configure(text=f"Remote server test OK", fg=GREEN)
+                msg = "Remote server test OK"
+                self.logger.info(msg)
+                self.StatusLabel.configure(text=msg, fg=GREEN)
             else:
-                self.StatusLabel.configure(text=f"Remote server test ERROR", fg=RED)
+                msg = "Remote server test ERROR"
+                self.logger.info(msg)
+                self.StatusLabel.configure(text=msg, fg=RED)
         except Exception as err:
-            self.StatusLabel.configure(text=f"{err}")
+            self.logger.warning(f"Check error", exc_info=err)
+            self.StatusLabel.configure(text=str(err), fg=RED)
 
         self.AddButton.configure(state=tk.NORMAL)
 
@@ -840,6 +857,7 @@ class ScrolledListBox(AutoScroll, tk.Listbox):
     def __init__(self, master, **kw):
         tk.Listbox.__init__(self, master, **kw)
         AutoScroll.__init__(self, master)
+
     def size_(self):
         sz = tk.Listbox.size(self)
         return sz
@@ -856,6 +874,7 @@ def _bound_to_mousewheel(event, widget):
         child.bind_all('<Shift-Button-4>', lambda e: _on_shiftmouse(e, child))
         child.bind_all('<Shift-Button-5>', lambda e: _on_shiftmouse(e, child))
 
+
 def _unbound_to_mousewheel(event, widget):
     if platform.system() == 'Windows' or platform.system() == 'Darwin':
         widget.unbind_all('<MouseWheel>')
@@ -865,6 +884,7 @@ def _unbound_to_mousewheel(event, widget):
         widget.unbind_all('<Button-5>')
         widget.unbind_all('<Shift-Button-4>')
         widget.unbind_all('<Shift-Button-5>')
+
 
 def _on_mousewheel(event, widget):
     if platform.system() == 'Windows':
@@ -876,6 +896,7 @@ def _on_mousewheel(event, widget):
             widget.yview_scroll(-1, 'units')
         elif event.num == 5:
             widget.yview_scroll(1, 'units')
+
 
 def _on_shiftmouse(event, widget):
     if platform.system() == 'Windows':
