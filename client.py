@@ -455,7 +455,7 @@ class MainWindow:
 
         self.config = Config.load()
         self._logger = ClientLogger(self.config.log_level, self.config.log_level)
-        self.client = Client(self._logger, self.config.client_buffsize, self.config.client_file_block_size)
+        self.client = Client(self, self._logger, self.config.client_buffsize, self.config.client_file_block_size)
         self.logger = LoggerAdapter(self._logger, extra={
             "window": "Main Window"
         })
@@ -729,7 +729,7 @@ class MainWindow:
 
         to_rm = []
         for i, fileitem in fileitems:
-            self.mwh.cancel_button.configure(state=tk.NORMAL)
+            self.cancel_button.configure(state=tk.NORMAL)
 
             src, dest = fileitem.split(FILES_SEP)
             src = Path(src)
@@ -744,7 +744,6 @@ class MainWindow:
                 self.print_status("Error when sending file info", RED, action_msg)
                 continue
 
-
             action_msg = ResponseMsg()
             if self.client.send_file(src, file_inf.size, action_msg, progress):
                 self.print_status(f"File {src} sent successfully", GREEN, action_msg)
@@ -754,9 +753,9 @@ class MainWindow:
                 if action_msg and hasattr(action_msg, "server_response"):
                     if action_msg.server_response == CANCELED:
                         self.print_status(f"Sending {src} canceled", ORANGE, action_msg=action_msg)
-                self.mwh.progressbar.configure(value=0)
+                self.progressbar.configure(value=0)
 
-            self.mwh.cancel_button.configure(state=tk.DISABLED)
+            self.cancel_button.configure(state=tk.DISABLED)
 
         to_rm.reverse()
 
@@ -994,6 +993,6 @@ if __name__ == "__main__":
     root = tk.Tk()
     root.protocol('WM_DELETE_WINDOW', root.destroy)
 
-    self.mwh: MainWindow = MainWindow(root)
+    mwh: MainWindow = MainWindow(root)
 
     root.mainloop()
