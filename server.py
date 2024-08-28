@@ -25,6 +25,11 @@ ERROR_B = b"ERROR"
 
 OK = "OK"
 
+
+def default_json(o: object):
+    return f"<not serializable {o.__qualname__}>"
+
+
 class ServerLogger(Logger):
 
     MSG_FORMAT = "[%(asctime)s] [%(name)s] [%(levelname)7s] [%(client)20s] [%(action)10s] | %(message)s"
@@ -107,7 +112,6 @@ class ClientSession:
 
         self.logger = LoggerAdapter(logger, extra={
             'client': addr,
-            'action': 'session'
         })
 
     def parse_block(self) -> ActionData:
@@ -121,7 +125,7 @@ class ClientSession:
             action = ActionData(**data)
             self.actions.appendleft(action)
 
-            self.logger.info(f"New queued action: {json.dumps(data, indent=4)}")
+            self.logger.info(f"New queued action: {json.dumps(data, indent=4, default=default_json)}")
         except Exception as exc:
             self.logger.warning(f"WARN - could not parse block into action data, dropping", exc_info=exc)
 
@@ -143,8 +147,8 @@ class Server:
                  root_dir: str = "./",
                  log_level: int = DEBUG):
 
-        if file_block_size > 65535:
-            raise ValueError("File block size cannot be bigger than 65535 bytes")
+        # if file_block_size > 65535:
+        #     raise ValueError("File block size cannot be bigger than 65535 bytes")
 
         self.host = host
         self.port = listening_port
@@ -205,7 +209,7 @@ class Server:
 
                 session.file_info.dest_path = str(self.root_dir/session.file_info.dest_path)
 
-                logger.info(f"Set file info to {json.dumps(asdict(session.file_info), indent=4)}")
+                logger.info(f"Set file info to {json.dumps(asdict(session.file_info), indent=4, default=default_json)}")
 
                 session.outb.extend(OK_B)
             except Exception as err:
@@ -229,7 +233,7 @@ class Server:
                 logger.info(f"Prepared to receive file")
             except Exception as err:
                 session.outb.extend(str(err).encode(session.encoding))
-                logger.warning(f"Could not prepare to receive file", exc_info=err)
+                logger.warning("Could not prepare to receive file", exc_info=err)
 
         elif action.action == Actions.CLEAR_FILE_INFO:
             if session.is_receiving_file:
@@ -300,8 +304,8 @@ class Server:
                         session.file_io.write(recv_data)
                         session.file_info.size_transmited += len(recv_data)
 
-                        self.logger.debug(f"""{session.file_info.size_transmited}/{session.file_info.size} bytes
-                                            of {session.file_info.dest_path} successfuly received""")
+                        session.logger.debug(f"""{session.file_info.size_transmited}/{session.file_info.size} bytes
+                                             successfuly received""")
 
                         if session.file_info.size == session.file_info.size_transmited:
 
@@ -309,7 +313,7 @@ class Server:
                             session.is_receiving_file = False
                             session.file_io = None
 
-                            self.logger.info(f"File {session.file_info.dest_path} successfuly received")
+                            session.logger.info(f"File {session.file_info.dest_path} successfuly received")
 
                             session.outb.extend(OK_B)
                             session.outb.extend(ETB)
@@ -351,9 +355,10 @@ class Server:
 
         sock.close()
 
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-                    prog='File transfer server',
+                    prog='server.py',
                     description='File transfer server')
     parser.add_argument("host",
                         help="IP address or hostname")

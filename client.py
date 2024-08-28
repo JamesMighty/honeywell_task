@@ -5,6 +5,7 @@ import os.path
 import platform
 import socket
 import sys
+from datetime import datetime, timedelta
 import tkinter as tk
 import tkinter.ttk as ttk
 from collections import deque
@@ -26,6 +27,10 @@ CANCELED = "CANCELED"
 OK = "OK"
 
 CONFIG_FILENAME = "client-config.json"
+
+
+def default_json(o: object):
+    return f"<not serializable {o.__qualname__}>"
 
 
 class Actions(int, Enum):
@@ -101,6 +106,43 @@ class Config:
         return Path(f"./{CONFIG_FILENAME}")
 
 
+@dataclass
+class TransferProgress:
+    current_file_src: str
+
+    file_size: int
+    size_sent: int
+
+    start_time: datetime
+
+    current_file_count: int
+    file_count: int = 1
+
+    @staticmethod
+    def human_readable_size(size, decimal_places=2):
+        for unit in ['B', 'KiB', 'MiB', 'GiB', 'TiB', 'PiB']:
+            if size < 1024.0 or unit == 'PiB':
+                break
+            size /= 1024.0
+        return f"{size:.{decimal_places}f} {unit}"
+
+    def get_progress_string(self):
+        speed_str = "N/A B/s"
+        time_needed_str = "N/A s"
+        time_ = (datetime.now()-self.start_time)
+
+        if time_.seconds > 2:
+            speed = self.size_sent/time_.seconds
+            speed_str = TransferProgress.human_readable_size(speed, 0)
+            time_needed = timedelta(seconds=(self.file_size - self.size_sent)/speed)
+            time_needed_str = str(time_needed).split('.', 2)[0]
+
+        return f"{self.current_file_count}/{self.file_count} files " \
+         f"- {self.current_file_src} [{TransferProgress.human_readable_size(self.size_sent)}/" \
+         f"{TransferProgress.human_readable_size(self.file_size)}, {str(time_).split('.', 2)[0]}/{time_needed_str}, " \
+         f"{speed_str}/s]"
+
+
 class ResponseMsg:
     """Defines trace information when communicating with server"""
     client_send: str
@@ -143,9 +185,10 @@ class Client:
     is_connected: bool
     cancel_transfer: bool
 
-    def __init__(self, logger: Logger, buffersize: int = 1024, file_block_size: int = 1024, encoding: str = "utf-8") -> None:
+    def __init__(self, mwh: 'MainWindow', logger: Logger, buffersize: int = 1024, file_block_size: int = 1024, encoding: str = "utf-8") -> None:
         self.buffer_size = buffersize
         self.encoding = encoding
+        self.mwh = mwh
         self.sock = None
         self.inb = bytearray()
         self.responses = deque()
@@ -170,7 +213,7 @@ class Client:
         self.logger.info(f"Sending action {action.action.name}")
         action_send_ok = False
         try:
-            data_raw = json.dumps(asdict(action))
+            data_raw = json.dumps(asdict(action), default=default_json)
             self.sock.send(data_raw.encode(self.encoding))
             self.sock.send(ETB)
             action_send_ok = True
@@ -186,20 +229,22 @@ class Client:
         try:
             self.sock.setblocking(True)
             s = self.sock.recv(self.buffer_size)
-            self.sock.setblocking(False)
         except Exception as err:
             if msg:
                 msg.client_read = err
             return False
 
+        self.sock.setblocking(False)
         while s:
             self.inb.extend(s)
             try:
                 s = self.sock.recv(self.buffer_size)
             except socket.error as err:
                 if err.errno == errno.EAGAIN or err.errno == errno.EWOULDBLOCK:
+                    # This is ok - no blocking - so no msg to receive
                     break
                 else:
+                    # This is bad
                     if msg:
                         msg.client_read = err
                     return False
@@ -255,7 +300,7 @@ class Client:
             msg.server_response = resp
         return resp == OK
 
-    def send_file(self, src_filepath: str, size: int, msg: ResponseMsg = None) -> bool:
+    def send_file(self, src_filepath: str, size: int, msg: ResponseMsg = None, prog: TransferProgress = None) -> bool:
         if not self.is_connected:
             if msg:
                 msg.client_send = ConnectionError("Client not connected")
@@ -269,8 +314,24 @@ class Client:
             return False
 
         size_sent = 0
-        main_window.TProgressbar.configure(maximum=size, value=0)
-        file_io = open(src_filepath, 'rb')
+
+        if prog:
+            prog.start_time = datetime.now()
+            prog.current_file_src = Path(src_filepath).name
+            prog.file_size = size
+            prog.size_sent = size_sent
+            self.mwh.print_status(prog.get_progress_string(), log_level=DEBUG)
+
+        self.mwh.progressbar.configure(maximum=size, value=0)
+
+        try:
+            file_io = open(src_filepath, 'rb')
+        except OSError as err:
+            if msg:
+                msg.client_send = err
+            self.logger.error(f"Could not open file {src_filepath}", exc_info=err)
+            return False
+
         while size_sent != size:
             if self.cancel_transfer:
                 self.sock.send(CANCEL_B)
@@ -281,16 +342,26 @@ class Client:
                 count = self.file_block_size
                 if size - size_sent < count:
                     count = size - size_sent
+
                 size_send_ = self.sock.sendfile(file_io, size_sent, count=count)
                 size_sent += size_send_
-                main_window.TProgressbar.step(size_send_)
+
+                if prog:
+                    prog.size_sent = size_sent
+                    self.mwh.print_status(prog.get_progress_string(), log_level=DEBUG)
+
+                self.mwh.progressbar.step(size_send_)
             except Exception as err:
+                self.logger.error("Exception when sending file", exc_info=err)
                 if msg:
                     msg.client_send = err
                 return False
 
             root.update()
+
         file_io.close()
+        if prog:
+            prog.current_file_count += 1
 
         if not self._read_responses(msg):
             return False
@@ -399,98 +470,99 @@ class MainWindow:
         self.menubar.add_cascade(label="Settings", menu=self.settingsmenu)
         top.configure(menu=self.menubar)
 
-
         # --- FILES ---
-        self.FilesLabel = tk.Label(self.top,
+        self.files_label = tk.Label(self.top,
                                    text='''Files''',
                                    **LABEL_DEFAULTS)
 
-        self.FilesScrolledlistbox = ScrolledListBox(self.top, **LISTBOX_DEFAULTS)
-        self.FilesScrolledlistbox.bind('<<ListboxSelect>>', lambda _: self._update_states())
+        self.files_scrolled_listbox = ScrolledListBox(self.top, selectmode=tk.MULTIPLE, **LISTBOX_DEFAULTS)
+        self.files_scrolled_listbox.bind('<<ListboxSelect>>', lambda _: self._update_states())
 
-        self.AddFileButton = tk.Button(self.top,
+        self.add_file_button = tk.Button(self.top,
                                        command=self._add_file_button_click,
                                        text='''+''',
                                        **WIDGET_DEFAULTS)
 
-        self.RemoveFileButton = tk.Button(self.top,
+        self.remove_file_button = tk.Button(self.top,
                                           command=self._remove_file_selection_click,
                                           text='''-''',
                                           **WIDGET_DEFAULTS)
 
-        self.ClearFilesButton = tk.Button(self.top,
+        self.clear_files_button = tk.Button(self.top,
                                           command=self._clear_files_click,
                                           text='''Clear''',
                                           **WIDGET_DEFAULTS)
 
         # --- SERVERS ---
-        self.ServersLabel = tk.Label(self.top, text='''Servers''', **LABEL_DEFAULTS)
+        self.servers_label = tk.Label(self.top, text='''Servers''', **LABEL_DEFAULTS)
 
-        self.ServersScrolledlistbox = ScrolledListBox(self.top, **LISTBOX_DEFAULTS)
-        self.ServersScrolledlistbox.bind('<<ListboxSelect>>', lambda _: self._update_states())
+        self.servers_scrolled_listbox = ScrolledListBox(self.top, **LISTBOX_DEFAULTS)
+        self.servers_scrolled_listbox.bind('<<ListboxSelect>>', lambda _: self._update_states())
 
-        self.AddServerButton = tk.Button(self.top,
-                                         command=self._add_server_button_click,
-                                         text='''+''',
-                                         **WIDGET_DEFAULTS)
+        self.add_server_button = tk.Button(self.top,
+                                           command=self._add_server_button_click,
+                                           text='''+''',
+                                           **WIDGET_DEFAULTS)
 
-        self.RemoveServerButton = tk.Button(self.top,
-                                            command=self._remove_server_selection_click,
-                                            text='''-''',
-                                            **WIDGET_DEFAULTS)
+        self.remove_server_button = tk.Button(self.top,
+                                              command=self._remove_server_selection_click,
+                                              text='''-''',
+                                              **WIDGET_DEFAULTS)
 
-        self.ClearServersButton = tk.Button(self.top,
-                                            command=self._clear_servers_click,
-                                            text='''Clear''',
-                                            **WIDGET_DEFAULTS)
+        self.clear_server_button = tk.Button(self.top,
+                                             command=self._clear_servers_click,
+                                             text='''Clear''',
+                                             **WIDGET_DEFAULTS)
 
         # --- PROGRESS ---
-        self.TProgressbar = ttk.Progressbar(self.top)
-        self.TProgressbar.configure(length="560")
+        self.progressbar = ttk.Progressbar(self.top)
+        self.progressbar.configure(length="560")
+
 
         # --- STATUS ---
-        self.StatusLabel = tk.Label(self.top, wraplength=790, **LABEL_DEFAULTS)
+        self.status_label = tk.Label(self.top, wraplength=780, **LABEL_DEFAULTS)
 
-        self.StatusLabel_ = tk.Label(self.top, text='''Status:''', **LABEL_DEFAULTS)
+        self.status_label_ = tk.Label(self.top, text='''Status:''', **LABEL_DEFAULTS)
 
         # --- ACTIONS ---
-        self.SendSelectedButton = tk.Button(self.top,
+        self.send_select_button = tk.Button(self.top,
                                             command=self._send_selection_click,
                                             text='''Send selected file''',
                                             **WIDGET_DEFAULTS)
 
-        self.CancelButton = tk.Button(self.top,
-                                      state=tk.DISABLED,
-                                      command=self._cancel_click,
-                                      text='''Cancel''',
-                                      **WIDGET_DEFAULTS)
+        self.cancel_button = tk.Button(self.top,
+                                       state=tk.DISABLED,
+                                       command=self._cancel_click,
+                                       text='''Cancel''',
+                                       **WIDGET_DEFAULTS)
 
-        self.SendAllFiles = tk.Button(self.top,
-                                      text='''Send all files''',
-                                      command=self._send_all_click,
-                                      **WIDGET_DEFAULTS)
+        self.send_all_files_button = tk.Button(self.top,
+                                               text='''Send all files''',
+                                               command=self._send_all_click,
+                                               **WIDGET_DEFAULTS)
 
-        self.FilesLabel.place(x=20, y=20, height=20, width=500)
-        self.ServersLabel.place(x=638, y=20,  height=20, width=222)
+        self.files_label.place(x=20, y=20, height=20, width=500)
+        self.servers_label.place(x=658, y=20,  height=20, width=222)
 
-        self.FilesScrolledlistbox.place(x=20, y=40,  height=260, width=566)
-        self.ServersScrolledlistbox.place(x=658, y=40,  height=260, width=160)
+        self.files_scrolled_listbox.place(x=20, y=40,  height=260, width=566)
+        self.servers_scrolled_listbox.place(x=658, y=40,  height=260, width=160)
 
-        self.AddFileButton.place(x=596, y=40, height=26, width=26)
-        self.RemoveFileButton.place(x=596, y=76, height=26, width=26)
-        self.ClearFilesButton.place(x=596, y=112, height=26, width=52)
+        self.add_file_button.place(x=596, y=40, height=26, width=26)
+        self.remove_file_button.place(x=596, y=76, height=26, width=26)
+        self.clear_files_button.place(x=596, y=112, height=26, width=52)
 
-        self.AddServerButton.place(x=828, y=40, height=26, width=26)
-        self.RemoveServerButton.place(x=828, y=76, height=26, width=26)
-        self.ClearServersButton.place(x=828, y=112, height=26, width=52)
+        self.add_server_button.place(x=828, y=40, height=26, width=26)
+        self.remove_server_button.place(x=828, y=76, height=26, width=26)
+        self.clear_server_button.place(x=828, y=112, height=26, width=52)
 
-        self.TProgressbar.place(x=20, y=320, width=860, height=20)
-        self.StatusLabel_.place(x=20, y=350, height=21, width=60)
-        self.StatusLabel.place(x=90, y=350, width=790, height=60)
+        self.progressbar.place(x=20, y=320, width=860, height=20)
 
-        self.CancelButton.place(x=20, y=414, height=26, width=50)
-        self.SendAllFiles.place(x=634, y=414, height=26, width=118)
-        self.SendSelectedButton.place(x=762, y=414, height=26, width=118)
+        self.status_label_.place(x=20, y=350, height=21, width=60)
+        self.status_label.place(x=90, y=350, width=790, height=60)
+
+        self.cancel_button.place(x=20, y=414, height=26, width=50)
+        self.send_all_files_button.place(x=634, y=414, height=26, width=118)
+        self.send_select_button.place(x=762, y=414, height=26, width=118)
 
         self._update_states()
         self._load_settings()
@@ -500,37 +572,37 @@ class MainWindow:
         is_file_selected = False
         is_server_selected = False
 
-        files = self.FilesScrolledlistbox.get(0, tk.END)
-        self.RemoveFileButton.configure(state=tk.DISABLED)
+        files = self.files_scrolled_listbox.get(0, tk.END)
+        self.remove_file_button.configure(state=tk.DISABLED)
         if len(files) == 0:
-            self.ClearFilesButton.configure(state=tk.DISABLED)
+            self.clear_files_button.configure(state=tk.DISABLED)
         else:
-            self.ClearFilesButton.configure(state=tk.NORMAL)
-            sel = self.FilesScrolledlistbox.curselection()
+            self.clear_files_button.configure(state=tk.NORMAL)
+            sel = self.files_scrolled_listbox.curselection()
             if len(sel) > 0:
-                self.RemoveFileButton.configure(state=tk.NORMAL)
+                self.remove_file_button.configure(state=tk.NORMAL)
                 is_file_selected = True
 
-        servers = self.ServersScrolledlistbox.get(0, tk.END)
-        self.RemoveServerButton.configure(state=tk.DISABLED)
+        servers = self.servers_scrolled_listbox.get(0, tk.END)
+        self.remove_server_button.configure(state=tk.DISABLED)
         if len(servers) == 0:
-            self.ClearServersButton.configure(state=tk.DISABLED)
+            self.clear_server_button.configure(state=tk.DISABLED)
         else:
-            self.ClearServersButton.configure(state=tk.NORMAL)
-            sel = self.ServersScrolledlistbox.curselection()
+            self.clear_server_button.configure(state=tk.NORMAL)
+            sel = self.servers_scrolled_listbox.curselection()
             if len(sel) > 0:
-                self.RemoveServerButton.configure(state=tk.NORMAL)
+                self.remove_server_button.configure(state=tk.NORMAL)
                 is_server_selected = True
 
         if is_server_selected:
             if is_file_selected:
-                self.SendSelectedButton.configure(state=tk.NORMAL)
+                self.send_select_button.configure(state=tk.NORMAL)
 
             if len(files) > 0:
-                self.SendAllFiles.configure(state=tk.NORMAL)
+                self.send_all_files_button.configure(state=tk.NORMAL)
         else:
-            self.SendSelectedButton.configure(state=tk.DISABLED)
-            self.SendAllFiles.configure(state=tk.DISABLED)
+            self.send_select_button.configure(state=tk.DISABLED)
+            self.send_all_files_button.configure(state=tk.DISABLED)
 
     def _add_file_button_click(self):
         """On button click event - Try to add file to send"""
@@ -554,7 +626,7 @@ class MainWindow:
 
         # Check with server if filepath exists, if yes ask if u wish to continue
 
-        self.FilesScrolledlistbox.insert(0, f"{selected_filepath}{FILES_SEP}{dest_filepath}")
+        self.files_scrolled_listbox.insert(0, f"{selected_filepath}{FILES_SEP}{dest_filepath}")
         self._update_states()
 
     def _add_server_button_click(self):
@@ -572,9 +644,9 @@ class MainWindow:
         host = str(data.get("host"))
         port = int(data.get("port"))
 
-        self.ServersScrolledlistbox.insert(0, f"{host}:{port}")
+        self.servers_scrolled_listbox.insert(0, f"{host}:{port}")
 
-    def print_status(self, msg: str, color: str = "black", action_msg: ResponseMsg = None):
+    def print_status(self, msg: str, color: str = "black", action_msg: ResponseMsg = None, log_level: int = INFO):
         """Print defines message to status label"""
 
         full_msg = msg
@@ -586,38 +658,38 @@ class MainWindow:
             if hasattr(action_msg, "client_read"):
                 full_msg += f", client read: {action_msg.client_read}"
 
-        self.StatusLabel.configure(text=full_msg, fg=color)
-        self.logger.info(full_msg)
+        self.status_label.configure(text=full_msg, fg=color)
+        self.logger.log(log_level, full_msg)
 
     def _remove_file_selection_click(self):
-        for index in self.FilesScrolledlistbox.curselection():
-            self.FilesScrolledlistbox.delete(index)
-            self.FilesScrolledlistbox.selection_clear(index)
+        for index in self.files_scrolled_listbox.curselection():
+            self.files_scrolled_listbox.delete(index)
+            self.files_scrolled_listbox.selection_clear(index)
         self._update_states()
 
     def _remove_server_selection_click(self):
-        for index in self.ServersScrolledlistbox.curselection():
-            self.ServersScrolledlistbox.delete(index)
-            self.ServersScrolledlistbox.selection_clear(index)
+        for index in self.servers_scrolled_listbox.curselection():
+            self.servers_scrolled_listbox.delete(index)
+            self.servers_scrolled_listbox.selection_clear(index)
         self._update_states()
 
     def _clear_files_click(self):
-        self.FilesScrolledlistbox.delete(0, tk.END)
+        self.files_scrolled_listbox.delete(0, tk.END)
         self._update_states()
 
     def _clear_servers_click(self):
-        self.ServersScrolledlistbox.delete(0, tk.END)
+        self.servers_scrolled_listbox.delete(0, tk.END)
         self._update_states()
 
     def _send_selection_click(self):
-        sel = self.FilesScrolledlistbox.curselection()
+        sel = self.files_scrolled_listbox.curselection()
         fileitems = []
         for i in sel:
-            fileitems.append((i, self.FilesScrolledlistbox.get(i)))
+            fileitems.append((i, self.files_scrolled_listbox.get(i)))
         self._send_files(fileitems)
 
     def _send_all_click(self):
-        fileitems = list(enumerate(self.FilesScrolledlistbox.get(0, tk.END)))
+        fileitems = list(enumerate(self.files_scrolled_listbox.get(0, tk.END)))
         self._send_files(fileitems)
 
     def _cancel_click(self):
@@ -626,20 +698,22 @@ class MainWindow:
 
     def _save_settings(self):
         try:
-            self.config.files = self.FilesScrolledlistbox.get(0, tk.END)
-            self.config.servers = self.ServersScrolledlistbox.get(0, tk.END)
+            self.config.files = self.files_scrolled_listbox.get(0, tk.END)
+            self.config.servers = self.servers_scrolled_listbox.get(0, tk.END)
             self.config.save()
             self.print_status(f"Config saved to {Config.get_path()}", GREEN)
         except Exception as err:
             self.print_status(f"Config could not be saved: {err}", RED)
 
-    def _send_files(self, fileitems: list[str]):
-        self.SendAllFiles.configure(state=tk.DISABLED)
-        self.SendSelectedButton.configure(state=tk.DISABLED)
+    def _send_files(self, fileitems: list[tuple[int, str]]):
+        self.send_all_files_button.configure(state=tk.DISABLED)
+        self.send_select_button.configure(state=tk.DISABLED)
 
-        server = self.ServersScrolledlistbox.get(self.ServersScrolledlistbox.curselection())
+        server = self.servers_scrolled_listbox.get(self.servers_scrolled_listbox.curselection())
         host, port = str(server).split(SERVER_SEP)
         port = int(port)
+
+        progress = TransferProgress(None, 0, 0, datetime.now(), 0,  len(fileitems))
 
         try:
             self.client.connect(host, port)
@@ -655,7 +729,7 @@ class MainWindow:
 
         to_rm = []
         for i, fileitem in fileitems:
-            main_window.CancelButton.configure(state=tk.NORMAL)
+            self.mwh.cancel_button.configure(state=tk.NORMAL)
 
             src, dest = fileitem.split(FILES_SEP)
             src = Path(src)
@@ -670,10 +744,9 @@ class MainWindow:
                 self.print_status("Error when sending file info", RED, action_msg)
                 continue
 
-            self.print_status(f"Transferring {src}")
 
             action_msg = ResponseMsg()
-            if self.client.send_file(src, file_inf.size, action_msg):
+            if self.client.send_file(src, file_inf.size, action_msg, progress):
                 self.print_status(f"File {src} sent successfully", GREEN, action_msg)
                 to_rm.append(i)
             else:
@@ -681,12 +754,15 @@ class MainWindow:
                 if action_msg and hasattr(action_msg, "server_response"):
                     if action_msg.server_response == CANCELED:
                         self.print_status(f"Sending {src} canceled", ORANGE, action_msg=action_msg)
-                main_window.TProgressbar.configure(value=0)
+                self.mwh.progressbar.configure(value=0)
 
-            main_window.CancelButton.configure(state=tk.DISABLED)
+            self.mwh.cancel_button.configure(state=tk.DISABLED)
+
+        to_rm.reverse()
 
         for i in to_rm:
-            self.FilesScrolledlistbox.delete(i)
+            self.files_scrolled_listbox.delete(i)
+            self.files_scrolled_listbox.selection_clear(i)
 
         self._update_states()
 
@@ -695,8 +771,8 @@ class MainWindow:
             self.config.load()
             self._clear_files_click()
             self._clear_servers_click()
-            self.FilesScrolledlistbox.insert(0, *self.config.files)
-            self.ServersScrolledlistbox.insert(0, *self.config.servers)
+            self.files_scrolled_listbox.insert(0, *self.config.files)
+            self.servers_scrolled_listbox.insert(0, *self.config.servers)
             self.client.buffer_size = self.config.client_buffsize
             self.client.file_block_size = self.config.client_file_block_size
             self._update_states()
@@ -724,38 +800,38 @@ class AddServerDialog:
             "window": "Add Server Window"
             })
 
-        self.HostEntry = tk.Entry(self.top, textvariable=self.host, **WIDGET_DEFAULTS)
-        self.HostEntry.place(x=143, y=21, height=20, width=204)
+        self.host_entry = tk.Entry(self.top, textvariable=self.host, **WIDGET_DEFAULTS)
+        self.host_entry.place(x=143, y=21, height=20, width=204)
 
-        self.HostLabel = tk.Label(self.top, text='''Hostname or IP:''', **LABEL_DEFAULTS)
-        self.HostLabel.place(x=21, y=21, height=15, width=103)
+        self.host_label = tk.Label(self.top, text='''Hostname or IP:''', **LABEL_DEFAULTS)
+        self.host_label.place(x=21, y=21, height=15, width=103)
 
-        self.PortLabel = tk.Label(self.top, text='''Port:''', **LABEL_DEFAULTS)
-        self.PortLabel.place(x=21, y=52, height=15, width=85)
+        self.port_label = tk.Label(self.top, text='''Port:''', **LABEL_DEFAULTS)
+        self.port_label.place(x=21, y=52, height=15, width=85)
 
-        self.PortEntry = tk.Entry(self.top, textvariable=self.port, **WIDGET_DEFAULTS)
-        self.PortEntry.place(x=143, y=52, height=20, width=204)
+        self.port_entry = tk.Entry(self.top, textvariable=self.port, **WIDGET_DEFAULTS)
+        self.port_entry.place(x=143, y=52, height=20, width=204)
 
-        self.StatusLabel_ = tk.Label(self.top, text='''Status:''', wraplength=116, **LABEL_DEFAULTS)
-        self.StatusLabel_.place(x=21, y=83, height=42, width=116)
+        self.status_label_ = tk.Label(self.top, text='''Status:''', wraplength=116, **LABEL_DEFAULTS)
+        self.status_label_.place(x=21, y=83, height=42, width=116)
 
-        self.StatusLabel = tk.Label(self.top, wraplength=205, **LABEL_DEFAULTS)
-        self.StatusLabel.place(x=143, y=83, height=42, width=209)
+        self.status_label = tk.Label(self.top, wraplength=205, **LABEL_DEFAULTS)
+        self.status_label.place(x=143, y=83, height=42, width=209)
 
-        self.TestButton = tk.Button(self.top,
+        self.test_button = tk.Button(self.top,
                                     command=self._test_button_click,
                                     text='''Test''',
                                     **WIDGET_DEFAULTS)
-        self.TestButton.place(x=240, y=135, height=26, width=47)
+        self.test_button.place(x=240, y=135, height=26, width=47)
 
-        self.AddButton = tk.Button(self.top, state=tk.DISABLED,
+        self.add_button = tk.Button(self.top, state=tk.DISABLED,
                                    command=self._add_button_click,
                                    text='''Add''',
                                    **WIDGET_DEFAULTS)
-        self.AddButton.place(x=300, y=135, height=26, width=47)
+        self.add_button.place(x=300, y=135, height=26, width=47)
 
-        self.host.trace_add("write", lambda _, _b, _c: self.AddButton.configure(state=tk.DISABLED))
-        self.port.trace_add("write", lambda _, _b, _c: self.AddButton.configure(state=tk.DISABLED))
+        self.host.trace_add("write", lambda _, _b, _c: self.add_button.configure(state=tk.DISABLED))
+        self.port.trace_add("write", lambda _, _b, _c: self.add_button.configure(state=tk.DISABLED))
 
     def _test_button_click(self):
         try:
@@ -769,7 +845,7 @@ class AddServerDialog:
             if port < 0 or port > 65535:
                 raise ValueError("Port number must be between 0 and 65535")
 
-            self.AddButton.configure(state=tk.NORMAL)
+            self.add_button.configure(state=tk.NORMAL)
             self.top.update_idletasks()
 
             # test
@@ -778,16 +854,15 @@ class AddServerDialog:
             if cli.test_connection():
                 msg = "Remote server test OK"
                 self.logger.info(msg)
-                self.StatusLabel.configure(text=msg, fg=GREEN)
+                self.status_label.configure(text=msg, fg=GREEN)
             else:
                 msg = "Remote server test ERROR"
                 self.logger.info(msg)
-                self.StatusLabel.configure(text=msg, fg=RED)
+                self.status_label.configure(text=msg, fg=RED)
 
         except Exception as err:
-            self.logger.warning(f"Check error", exc_info=err)
-            self.StatusLabel.configure(text=str(err), fg=RED)
-
+            self.logger.warning("Check error", exc_info=err)
+            self.status_label.configure(text=str(err), fg=RED)
 
     def _add_button_click(self):
         self.data['host'] = self.host.get()
@@ -867,7 +942,7 @@ class ScrolledListBox(AutoScroll, tk.Listbox):
         return sz
 
 
-def _bound_to_mousewheel(event, widget):
+def _bound_to_mousewheel(_, widget):
     child = widget.winfo_children()[0]
     if platform.system() == 'Windows' or platform.system() == 'Darwin':
         child.bind_all('<MouseWheel>', lambda e: _on_mousewheel(e, child))
@@ -892,9 +967,9 @@ def _unbound_to_mousewheel(event, widget):
 
 def _on_mousewheel(event, widget):
     if platform.system() == 'Windows':
-        widget.yview_scroll(-1*int(event.delta/120),'units')
+        widget.yview_scroll(-1*int(event.delta/120), 'units')
     elif platform.system() == 'Darwin':
-        widget.yview_scroll(-1*int(event.delta),'units')
+        widget.yview_scroll(-1*int(event.delta), 'units')
     else:
         if event.num == 4:
             widget.yview_scroll(-1, 'units')
@@ -916,11 +991,9 @@ def _on_shiftmouse(event, widget):
 
 if __name__ == "__main__":
 
-    global root
     root = tk.Tk()
-    root.protocol( 'WM_DELETE_WINDOW' , root.destroy)
+    root.protocol('WM_DELETE_WINDOW', root.destroy)
 
-    global main_window
-    main_window: MainWindow = MainWindow(root)
+    self.mwh: MainWindow = MainWindow(root)
 
     root.mainloop()
